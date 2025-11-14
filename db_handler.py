@@ -44,21 +44,16 @@ def insert_or_update_job_batch(job_id, identifiers, job_details=None):
     current_time = datetime.now()
     
     try:
-        # --- THIS IS THE KEY FIX ---
-        # The ON CONFLICT logic is now safer.
         cursor.execute(
             """
             INSERT INTO jobs (job_id, status, job_details)
             VALUES (%s, %s, %s)
             ON CONFLICT (job_id) DO UPDATE 
             SET status = EXCLUDED.status,
-                -- This line prevents NULL from overwriting existing text
-                -- It says: Use the new value, but if it's NULL, keep the old one.
                 job_details = COALESCE(EXCLUDED.job_details, jobs.job_details);
             """,
             (job_id, "IN_PROGRESS", job_details) 
         )
-        # --- END OF FIX ---
         
         for identifier in identifiers:
             cursor.execute(
@@ -82,8 +77,12 @@ def insert_or_update_job_batch(job_id, identifiers, job_details=None):
         cursor.close()
         conn.close()
 
-def update_detail_status_and_check_completion(job_id, identifier, new_status):
-    """Updates a single identifier's status and checks if the main job is complete."""
+# --- NEW FUNCTION (Replaces old logic) ---
+def update_detail_status(job_id, identifier, new_status):
+    """
+    Updates a single identifier's status.
+    This function NO LONGER checks for completion.
+    """
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -96,18 +95,38 @@ def update_detail_status_and_check_completion(job_id, identifier, new_status):
             """,
             (new_status, job_id, identifier)
         )
-        
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Error updating detail status for {job_id}/{identifier}: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+# --- NEW FUNCTION (The "Manager" Check) ---
+def check_and_complete_job(job_id):
+    """
+    Checks if all details for a job are done (PROCESSED or FAILED).
+    If so, marks the main job as COMPLETED.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # Check for any items that are still 'IN_PROGRESS'
         cursor.execute(
             """
             SELECT COUNT(*) 
             FROM job_details 
-            WHERE job_id = %s AND status != 'PROCESSED';
+            WHERE job_id = %s AND status = 'IN_PROGRESS';
             """,
             (job_id,)
         )
+        
         remaining_count = cursor.fetchone()[0]
         
         if remaining_count == 0:
+            # All items are either PROCESSED or FAILED, so the job is COMPLETED
             cursor.execute(
                 """
                 UPDATE jobs 
@@ -116,12 +135,15 @@ def update_detail_status_and_check_completion(job_id, identifier, new_status):
                 """,
                 ("COMPLETED", job_id)
             )
-        
+            print(f"Job {job_id} marked as COMPLETED.")
+        else:
+            print(f"Job {job_id} still has {remaining_count} items in progress.")
+
         conn.commit()
         return remaining_count == 0
     except Exception as e:
         conn.rollback()
-        print(f"Error updating detail status for {job_id}/{identifier}: {e}")
+        print(f"Error in check_and_complete_job for {job_id}: {e}")
         return False
     finally:
         cursor.close()
