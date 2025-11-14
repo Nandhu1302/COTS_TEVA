@@ -3,7 +3,14 @@ import uuid
 import time
 import os
 import pandas as pd
-from db_handler import init_db, insert_or_update_job_batch, update_detail_status_and_check_completion
+import asyncio
+# --- IMPORT THE NEW FUNCTIONS ---
+from db_handler import (
+    init_db, 
+    insert_or_update_job_batch, 
+    update_detail_status,  # <-- NEW
+    check_and_complete_job # <-- NEW
+)
 
 # --- Configuration ---
 UPLOAD_FOLDER = 'uploads'
@@ -13,43 +20,94 @@ if not os.path.exists(UPLOAD_FOLDER):
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# (Other functions: search_website, process_single_identifier... no changes needed)
 # ---------------------------
-# Simulate External Search (Simplified)
+# Simulate External Search (Async)
 # ---------------------------
-def search_website(identifier):
-    """Simulates the core processing logic that takes time."""
+async def search_website(identifier):
+    """Simulates the core processing logic that takes time (non-blocking)."""
     print(f"Searching website for identifier: {identifier}")
-    time.sleep(0.1) 
+    await asyncio.sleep(0.1) 
     print(f"Search completed for identifier: {identifier}")
 
 # ---------------------------
-# Core Processing Function
+# Dummy Async Function
 # ---------------------------
-def process_single_identifier(job_id, identifier):
-    """
-    Executes the external search and updates the database status.
-    """
-    # 1. Simulate the work
-    search_website(identifier)
+def write_dummy_file(file_name, content):
+    """Synchronous helper function to write a file."""
+    file_path = os.path.join(UPLOAD_FOLDER, file_name)
+    with open(file_path, 'w') as f:
+        f.write(content)
+
+async def dummy_async_function(job_id):
+    """Simulates another asynchronous function."""
+    print(f"[Job {job_id}] Starting dummy async task (will write a log file)...")
+    await asyncio.sleep(0.5)
     
-    # 2. Update status in job_details and check main job completion
-    update_detail_status_and_check_completion(job_id, identifier, "PROCESSED")
+    safe_job_id = job_id.replace('/', '_').replace('\\', '_')
+    file_name = f"dummy_log_{safe_job_id}.txt"
+    file_content = f"Log generated for job_id {job_id} at {time.ctime()}"
     
-    print(f"Identifier {identifier} for Job {job_id} is PROCESSED.")
+    try:
+        await asyncio.to_thread(write_dummy_file, file_name, file_content)
+        print(f"[Job {job_id}] Finished dummy async task (file '{file_name}' written).")
+        return f"Dummy task for {job_id} completed, file '{file_name}' created."
+    except Exception as e:
+        print(f"[Job {job_id}] Dummy task FAILED: {e}")
+        return f"Dummy task failed: {str(e)}"
+
+# ---------------------------
+# Core Processing Function (Async) - UPDATED
+# ---------------------------
+async def process_single_identifier(job_id, identifier):
+    """
+    Executes the external search (async) and updates the database (sync in thread).
+    This function NO LONGER checks for job completion.
+    """
+    try:
+        await search_website(identifier)
+        
+        # --- CHANGED ---
+        # Call the simpler function that only updates
+        await asyncio.to_thread(
+            update_detail_status, # <-- USE NEW FUNCTION
+            job_id, 
+            identifier, 
+            "PROCESSED"
+        )
+        # --- END CHANGE ---
+        
+        print(f"Identifier {identifier} for Job {job_id} is PROCESSED.")
+        return {"identifier": identifier, "status": "processed"}
+    
+    except Exception as e:
+        print(f"Identifier {identifier} for Job {job_id} FAILED: {e}")
+        
+        try:
+            # --- CHANGED ---
+            # Call the simpler function that only updates
+            await asyncio.to_thread(
+                update_detail_status, # <-- USE NEW FUNCTION
+                job_id, 
+                identifier, 
+                "FAILED"
+            )
+            # --- END CHANGE ---
+        except Exception as db_e:
+            print(f"Identifier {identifier} for Job {job_id} FAILED, and DB update also failed: {db_e}")
+        
+        return {"identifier": identifier, "status": "failed", "reason": f"Processing error: {str(e)}"}
 # ---------------------------
 
 @app.route('/start-job', methods=['POST'])
-def start_job():
+async def start_job():
     
-    # 1. Handle File Upload (key1)
+    # 1. Handle File Upload (No change)
     if 'key1' not in request.files:
         return jsonify({"error": "Excel/CSV file 'key1' is missing"}), 400
     data_file = request.files['key1']
     if data_file.filename == '':
         return jsonify({"error": "No selected file in 'key1'"}), 400
     
-    # Read data (no changes)
     try:
         filename = data_file.filename.lower()
         if filename.endswith(('.xlsx', '.xls')):
@@ -69,42 +127,59 @@ def start_job():
     except Exception as e:
         return jsonify({"error": f"Failed to read or process file: {str(e)}"}), 500
 
-    # 2. Get Job ID and Optional Details
+    # 2. Get Job ID and Details (No change)
     job_id = request.form.get('job_id') or str(uuid.uuid4())
-    job_details = request.form.get('job_details') # Get from form
+    job_details = request.form.get('job_details')
 
-    # --- THIS IS THE KEY DEBUG STEP ---
-    # This will print to your terminal (where you ran `python app.py`)
-    print("***********************************")
-    print(f"RECEIVED job_id: {job_id}")
-    print(f"RECEIVED job_details: {job_details}")
-    print(f"Type of job_details: {type(job_details)}")
-    print("***********************************")
-    # --- END OF DEBUG STEP ---
-    # 3. Insert/Update Job Batch in DB
-    if not insert_or_update_job_batch(job_id, identifiers, job_details):
-        return jsonify({"error": "Database failed to initialize the job batch."}), 500
+    # 3. Insert/Update Job Batch in DB (No change)
+    try:
+        await asyncio.to_thread(
+            insert_or_update_job_batch, 
+            job_id, 
+            identifiers, 
+            job_details
+        )
+    except Exception as e:
+         return jsonify({"error": f"Database failed to initialize the job batch: {str(e)}"}), 500
 
-    # 4. Process Jobs
-    results = []
+    # 4. Create tasks (No change)
+    processing_tasks = []
     for identifier in identifiers:
-        try:
+        processing_tasks.append(
             process_single_identifier(job_id, identifier)
-            results.append({"identifier": identifier, "status": "processed"})
-        except Exception as e:
-            results.append({"identifier": identifier, "status": "failed", "reason": f"Processing error: {str(e)}"})
+        )
+        
+    # 5. Create dummy task (No change)
+    dummy_task = dummy_async_function(job_id)
+    
+    # 6. Run tasks (No change)
+    all_tasks = [dummy_task] + processing_tasks
+    results = await asyncio.gather(*all_tasks)
+    
+    dummy_result = results[0]
+    processing_results = results[1:]
 
-    # 5. Return Final Response
+    # --- THIS IS THE NEW "MANAGER" STEP ---
+    # 7. Final check for completion
+    # After all tasks are gathered, run the final check ONCE.
+    try:
+        await asyncio.to_thread(check_and_complete_job, job_id)
+    except Exception as e:
+        print(f"Failed during final job completion check: {e}")
+        # Note: The job response is still sent, even if this check fails
+    # --- END OF NEW STEP ---
+
+    # 8. Return Final Response (Renumbered from 7)
     return jsonify({
-        "message": "Job batch initialized and processed successfully",
+        "message": "Job batch initialized and processed successfully (async)",
         "job_id": job_id,
         "details_count": len(identifiers),
-        "details": results
+        "dummy_task_result": dummy_result,
+        "details": processing_results
     })
 
 
 if __name__ == "__main__":
     init_db() 
     print("Starting Flask server...")
-    # Make sure debug=True is on so it reloads changes
-    app.run(host="0.0.0.0", port=5000, debug=True) 
+    app.run(host="0.0.0.0", port=5000, debug=True)
